@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
-import os, json, time, random, re, requests, threading
+import os, json, time, random, re, requests, threading, traceback
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
+
+def log(*args):
+    print(*args, flush=True)
+
+def run_in_thread(func, *args):
+    """執行 func 於背景 thread，自動捕捉並印出 exception。"""
+    def wrapper():
+        try:
+            func(*args)
+        except Exception:
+            log(f"[THREAD ERROR] {func.__name__}:")
+            traceback.print_exc()
+    threading.Thread(target=wrapper, daemon=True).start()
 
 BOT_TOKEN = os.environ.get("NOVEL_BOT_TOKEN", "")
 TONY_ID = os.environ.get("NOVEL_BOT_OWNER_ID", "8685464868")
@@ -35,9 +48,11 @@ def send(chat_id, text, parse_mode='HTML', reply_markup=None):
     if reply_markup:
         data['reply_markup'] = json.dumps(reply_markup)
     try:
-        requests.post(f"{API}/sendMessage", data=data, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(f"{API}/sendMessage", data=data, timeout=10)
+        if not r.ok:
+            log(f"[send ERROR] {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log(f"[send EXCEPTION] {e}")
 
 def edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
     data = {'chat_id': chat_id, 'message_id': message_id,
@@ -45,9 +60,11 @@ def edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None
     if reply_markup:
         data['reply_markup'] = json.dumps(reply_markup)
     try:
-        requests.post(f"{API}/editMessageText", data=data, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(f"{API}/editMessageText", data=data, timeout=10)
+        if not r.ok:
+            log(f"[edit ERROR] {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log(f"[edit EXCEPTION] {e}")
 
 def answer_callback(callback_id, text=''):
     try:
@@ -455,32 +472,32 @@ def handle_message(msg):
 
     if text == hot:
         send(chat_id, "\u23f3 \u53d6\u5f97\u71b1\u9580\u699c...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, get_hot_list(), "\ud83d\udd25 \u71b1\u9580\u699c"), daemon=True).start()
+        _cid = chat_id
+        run_in_thread(lambda: show_results(_cid, get_hot_list(), "\ud83d\udd25 \u71b1\u9580\u699c"))
         return
 
     if text == complete:
         send(chat_id, "\u23f3 \u641c\u5c0b\u5b8c\u672c\u5c0f\u8aaa...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, search_complete(), "\u2705 \u5b8c\u672c\u5c0f\u8aaa"), daemon=True).start()
+        _cid = chat_id
+        run_in_thread(lambda: show_results(_cid, search_complete(), "\u2705 \u5b8c\u672c\u5c0f\u8aaa"))
         return
 
     if text == weekly:
         send(chat_id, "\u23f3 \u53d6\u5f97\u9031\u6392\u884c...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, get_weekly_rank(), "\u2b50 \u9031\u6392\u884c"), daemon=True).start()
+        _cid = chat_id
+        run_in_thread(lambda: show_results(_cid, get_weekly_rank(), "\u2b50 \u9031\u6392\u884c"))
         return
 
     if text in CATEGORIES:
         cat = text
+        _cid = chat_id
         send(chat_id, f"\u23f3 \u53d6\u5f97\u300c{cat}\u300d\u71b1\u9580...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, get_hot_list(cat), f"\ud83d\udd25 {cat} \u71b1\u9580"), daemon=True).start()
+        run_in_thread(lambda: show_results(_cid, get_hot_list(cat), f"\ud83d\udd25 {cat} \u71b1\u9580"))
         return
 
+    _cid, _text = chat_id, text
     send(chat_id, f"\ud83d\udd0d \u641c\u5c0b\u300c{text}\u300d\u4e2d...")
-    threading.Thread(target=lambda: show_results(
-        chat_id, search_novels(text), f"\ud83d\udcda \u300c{text}\u300d\u641c\u5c0b\u7d50\u679c"), daemon=True).start()
+    run_in_thread(lambda: show_results(_cid, search_novels(_text), f"\ud83d\udcda \u300c{_text}\u300d\u641c\u5c0b\u7d50\u679c"))
 
 
 # ── Callback handler ───────────────────────────────────────────
@@ -531,7 +548,7 @@ def handle_callback(cb):
                         reply_markup=make_confirm_keyboard())
                 except Exception as e:
                     edit_message(chat_id, message_id, f"\u274c \u8b80\u53d6\u5931\u6557\uff1a{e}")
-            threading.Thread(target=load_detail, daemon=True).start()
+            run_in_thread(load_detail)
         return
 
     if data == 'confirm_download' and state.get('action') == 'confirm':
@@ -539,8 +556,7 @@ def handle_callback(cb):
         user_state.pop(chat_id, None)
         edit_message(chat_id, message_id,
             f"\ud83d\udce5 \u5df2\u52a0\u5165\u4e0b\u8f09\u4f47\u5217\n\u300a{book['title']}\u300b\n\n/status \u67e5\u770b\u9032\u5ea6")
-        threading.Thread(target=download_novel,
-            args=(chat_id, book['url'], book['title']), daemon=True).start()
+        run_in_thread(download_novel, chat_id, book['url'], book['title'])
         return
 
     if data == 'back':
@@ -562,25 +578,29 @@ def clear_old_updates():
 
 def run():
     if not BOT_TOKEN:
-        print("ERROR: NOVEL_BOT_TOKEN not set")
+        log("ERROR: NOVEL_BOT_TOKEN not set")
         return
-    print("Novel Bot v3-stable started")
-    clear_old_updates()
+    log(f"Novel Bot v3-stable started | TONY_ID={TONY_ID}")
     offset = 0
     while True:
         try:
             r = requests.get(f"{API}/getUpdates",
-                params={'offset': offset, 'timeout': 20}, timeout=25)
-            for u in r.json().get('result', []):
+                params={'offset': offset, 'timeout': 30}, timeout=35)
+            updates = r.json().get('result', [])
+            for u in updates:
                 offset = u['update_id'] + 1
                 if 'message' in u:
-                    threading.Thread(target=handle_message,
-                        args=(u['message'],), daemon=True).start()
+                    from_id = u['message']['chat']['id']
+                    text_preview = u['message'].get('text', '')[:40]
+                    log(f"[MSG] from={from_id} text={text_preview!r}")
+                    run_in_thread(handle_message, u['message'])
                 elif 'callback_query' in u:
-                    threading.Thread(target=handle_callback,
-                        args=(u['callback_query'],), daemon=True).start()
+                    from_id = u['callback_query']['message']['chat']['id']
+                    cb_data = u['callback_query'].get('data', '')
+                    log(f"[CB] from={from_id} data={cb_data!r}")
+                    run_in_thread(handle_callback, u['callback_query'])
         except Exception as e:
-            print(f"Error: {e}")
+            log(f"[POLL ERROR] {e}")
             time.sleep(5)
 
 if __name__ == '__main__':
