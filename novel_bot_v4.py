@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
-import os, json, time, random, re, requests, threading
+import os, json, time, random, re, requests, threading, traceback
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
-BOT_TOKEN = "8054493496:AAH-Uu560wOuW-GV2KLrjGDwTMGUxH0_5wg"
-TONY_ID = "8685464868"
+def log(*args):
+    print(*args, flush=True)
+
+def run_in_thread(func, *args):
+    """執行 func 於背景 thread，自動捕捉並印出 exception。"""
+    def wrapper():
+        try:
+            func(*args)
+        except Exception:
+            log(f"[THREAD ERROR] {func.__name__}:")
+            traceback.print_exc()
+    threading.Thread(target=wrapper, daemon=True).start()
+
+BOT_TOKEN = os.environ.get("NOVEL_BOT_TOKEN", "")
+TONY_ID = os.environ.get("NOVEL_BOT_OWNER_ID", "8685464868")
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Playwright semaphore: max 1 Chromium at a time
@@ -26,7 +39,8 @@ EXCLUDE_KEYWORDS = [
 ]
 
 user_state = {}
-download_status = {}
+download_status = {}   # key -> {title, current, total, done, failed}
+stop_flags = {}        # key -> True means stop requested
 PAGE_SIZE = 8
 
 
@@ -37,9 +51,11 @@ def send(chat_id, text, parse_mode='HTML', reply_markup=None):
     if reply_markup:
         data['reply_markup'] = json.dumps(reply_markup)
     try:
-        requests.post(f"{API}/sendMessage", data=data, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(f"{API}/sendMessage", data=data, timeout=10)
+        if not r.ok:
+            log(f"[send ERROR] {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log(f"[send EXCEPTION] {e}")
 
 def edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
     data = {'chat_id': chat_id, 'message_id': message_id,
@@ -47,9 +63,11 @@ def edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None
     if reply_markup:
         data['reply_markup'] = json.dumps(reply_markup)
     try:
-        requests.post(f"{API}/editMessageText", data=data, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(f"{API}/editMessageText", data=data, timeout=10)
+        if not r.ok:
+            log(f"[edit ERROR] {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log(f"[edit EXCEPTION] {e}")
 
 def answer_callback(callback_id, text=''):
     try:
@@ -331,7 +349,11 @@ def zxcs_download(chat_id, info):
 def download_czbooks(chat_id, url, title):
     key = f"{chat_id}_{title}"
     download_status[key] = {'title': title, 'current': 0, 'total': 0, 'done': False, 'failed': 0}
-    send(chat_id, f"\u23f3 \u958b\u59cb\u4e0b\u8f09\u300a{title}\u300b\n\u5b8c\u6210\u5f8c\u50b3 TXT\uff0c\u6bcf 500 \u7ae0\u56de\u5831")
+    stop_flags[key] = False
+    send(chat_id,
+         f"\u23f3 \u958b\u59cb\u4e0b\u8f09\u300a{title}\u300b\n"
+         f"\u5b8c\u6210\u5f8c\u50b3 TXT\uff0c\u6bcf 500 \u7ae0\u56de\u5831\n"
+         f"/status \u67e5\u9032\u5ea6\uff0c/stop \u7d42\u6b62\u4e0b\u8f09")
     try:
         with BROWSER_SEM:
             p, browser, ctx = get_browser()
@@ -358,6 +380,11 @@ def download_czbooks(chat_id, url, title):
                 f.write(f"\u300a{title}\u300b\n{'='*40}\n\n")
             failed = 0
             for i, ch in enumerate(chapters):
+                if stop_flags.get(key):
+                    send(chat_id, f"\u23f9 \u300a{title}\u300b\u5df2\u7d42\u6b62\u4e0b\u8f09\uff08{i}/{total} \u7ae0\uff09")
+                    browser.close()
+                    p.stop()
+                    return
                 content = None
                 retry = 0
                 while content is None and retry < 3:
@@ -409,6 +436,7 @@ def download_czbooks(chat_id, url, title):
         send(chat_id, f"\u274c \u4e0b\u8f09\u5931\u6557\uff1a{e}")
     finally:
         download_status.pop(key, None)
+        stop_flags.pop(key, None)
 
 
 # ── Keyboards ─────────────────────────────────────────────────
@@ -493,6 +521,7 @@ def handle_message(msg):
             "\u2022 \u76f4\u63a5\u8f38\u5165\u66f8\u540d \u2192 \u641c\u5c0b\n"
             "\u2022 \ud83d\udcda \u77e5\u8ecd\u85cf\u66f8 \u2192 \u7cbe\u6821\u5b8c\u672c TXT\n"
             "\u2022 /status \u2192 \u67e5\u770b\u4e0b\u8f09\u9032\u5ea6\n"
+            "\u2022 /stop \u2192 \u7d42\u6b62\u4e0b\u8f09\n"
             "\u2022 /cancel \u2192 \u53d6\u6d88",
             reply_markup=make_main_keyboard())
         return
@@ -510,18 +539,31 @@ def handle_message(msg):
             out = "\ud83d\udcca <b>\u4e0b\u8f09\u9032\u5ea6</b>\n\n"
             for k, s in active.items():
                 pct = f"{s.get('current',0)}/{s.get('total',0)}" if s.get('total') else '\u6e96\u5099\u4e2d'
-                out += f"\ud83d\udcd6 \u300a{s['title']}\u300b\n\u9032\u5ea6\uff1a{pct} \u7ae0\n"
+                out += f"\ud83d\udcd6 \u300a{s['title']}\u300b\n\u9032\u5ea6\uff1a{pct} \u7ae0"
+                if s.get('failed'):
+                    out += f" \uff08{s['failed']} \u7ae0\u5931\u6557\uff09"
+                out += "\n"
             send(chat_id, out)
+        return
+
+    if text == '/stop':
+        active = {k: v for k, v in download_status.items() if k.startswith(chat_id)}
+        if not active:
+            send(chat_id, "\ud83d\udced \u76ee\u524d\u6c92\u6709\u9032\u884c\u4e2d\u7684\u4e0b\u8f09")
+        else:
+            for k in active:
+                stop_flags[k] = True
+            titles = '\u3001'.join(v['title'] for v in active.values())
+            send(chat_id, f"\u23f9 \u5df2\u767c\u9001\u7d42\u6b62\u6307\u4ee4\uff1a{titles}")
         return
 
     state = user_state.get(chat_id, {})
 
     if state.get('action') == 'zxcs_search_input':
         user_state.pop(chat_id, None)
-        kw = text
-        send(chat_id, f"\ud83d\udd0d \u77e5\u8ecd\u641c\u5c0b\u300c{kw}\u300d\u4e2d...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, zxcs_search(kw), f"\ud83d\udcda \u77e5\u8ecd\u300c{kw}\u300d"), daemon=True).start()
+        _cid, _kw = chat_id, text
+        send(chat_id, f"\ud83d\udd0d \u77e5\u8ecd\u641c\u5c0b\u300c{_kw}\u300d\u4e2d...")
+        run_in_thread(lambda: show_results(_cid, zxcs_search(_kw), f"\ud83d\udcda \u77e5\u8ecd\u300c{_kw}\u300d"))
         return
 
     hot = '\ud83d\udd25 \u71b1\u9580\u699c'
@@ -531,33 +573,32 @@ def handle_message(msg):
 
     if text == hot:
         send(chat_id, "\u23f3 \u53d6\u5f97\u71b1\u9580\u699c...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, get_hot_list(), "\ud83d\udd25 \u71b1\u9580\u699c"), daemon=True).start()
+        _cid = chat_id
+        run_in_thread(lambda: show_results(_cid, get_hot_list(), "\ud83d\udd25 \u71b1\u9580\u699c"))
         return
     if text == complete:
         send(chat_id, "\u23f3 \u641c\u5c0b\u5b8c\u672c\u5c0f\u8aaa...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, search_complete(), "\u2705 \u5b8c\u672c\u5c0f\u8aaa"), daemon=True).start()
+        _cid = chat_id
+        run_in_thread(lambda: show_results(_cid, search_complete(), "\u2705 \u5b8c\u672c\u5c0f\u8aaa"))
         return
     if text == weekly:
         send(chat_id, "\u23f3 \u53d6\u5f97\u9031\u6392\u884c...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, get_weekly_rank(), "\u2b50 \u9031\u6392\u884c"), daemon=True).start()
+        _cid = chat_id
+        run_in_thread(lambda: show_results(_cid, get_weekly_rank(), "\u2b50 \u9031\u6392\u884c"))
         return
     if text == zxcs:
         send(chat_id, "\ud83d\udcda <b>\u77e5\u8ecd\u85cf\u66f8</b>\n\u7cbe\u6821\u5b8c\u672c TXT\n\n\u8acb\u9078\u64c7\u529f\u80fd\uff1a",
             reply_markup=make_zxcs_menu())
         return
     if text in CATEGORIES:
-        cat = text
+        _cid, cat = chat_id, text
         send(chat_id, f"\u23f3 \u53d6\u5f97\u300c{cat}\u300d\u71b1\u9580...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, get_hot_list(cat), f"\ud83d\udd25 {cat} \u71b1\u9580"), daemon=True).start()
+        run_in_thread(lambda: show_results(_cid, get_hot_list(cat), f"\ud83d\udd25 {cat} \u71b1\u9580"))
         return
 
+    _cid, _text = chat_id, text
     send(chat_id, f"\ud83d\udd0d \u641c\u5c0b\u300c{text}\u300d\u4e2d...")
-    threading.Thread(target=lambda: show_results(
-        chat_id, search_novels(text), f"\ud83d\udcda \u300c{text}\u300d\u641c\u5c0b\u7d50\u679c"), daemon=True).start()
+    run_in_thread(lambda: show_results(_cid, search_novels(_text), f"\ud83d\udcda \u300c{_text}\u300d\u641c\u5c0b\u7d50\u679c"))
 
 
 # ── Callback handler ───────────────────────────────────────────
@@ -581,19 +622,19 @@ def handle_callback(cb):
     state = user_state.get(chat_id, {})
 
     if data == 'zxcs_topdownload':
+        _cid, _mid = chat_id, message_id
         edit_message(chat_id, message_id, "\u23f3 \u53d6\u5f97\u77e5\u8ecd\u4e0b\u8f09\u6392\u884c...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, zxcs_rank('topdownload'), "\ud83d\udcda \u77e5\u8ecd \u4e0b\u8f09\u6392\u884c", message_id=message_id), daemon=True).start()
+        run_in_thread(lambda: show_results(_cid, zxcs_rank('topdownload'), "\ud83d\udcda \u77e5\u8ecd \u4e0b\u8f09\u6392\u884c", message_id=_mid))
         return
     if data == 'zxcs_toppraise':
+        _cid, _mid = chat_id, message_id
         edit_message(chat_id, message_id, "\u23f3 \u53d6\u5f97\u4ed9\u8349\u6392\u884c...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, zxcs_rank('toppraise'), "\ud83d\udcda \u77e5\u8ecd \u4ed9\u8349\u6392\u884c", message_id=message_id), daemon=True).start()
+        run_in_thread(lambda: show_results(_cid, zxcs_rank('toppraise'), "\ud83d\udcda \u77e5\u8ecd \u4ed9\u8349\u6392\u884c", message_id=_mid))
         return
     if data == 'zxcs_recommend':
+        _cid, _mid = chat_id, message_id
         edit_message(chat_id, message_id, "\u23f3 \u53d6\u5f97\u66f8\u8352\u63a8\u85a6...")
-        threading.Thread(target=lambda: show_results(
-            chat_id, zxcs_recommend(), "\ud83d\udcda \u77e5\u8ecd \u66f8\u8352\u63a8\u85a6", message_id=message_id), daemon=True).start()
+        run_in_thread(lambda: show_results(_cid, zxcs_recommend(), "\ud83d\udcda \u77e5\u8ecd \u66f8\u8352\u63a8\u85a6", message_id=_mid))
         return
     if data == 'zxcs_search':
         edit_message(chat_id, message_id, "\ud83d\udd0d \u8acb\u8f38\u5165\u8981\u641c\u5c0b\u7684\u66f8\u540d\uff1a")
@@ -620,25 +661,19 @@ def handle_callback(cb):
             edit_message(chat_id, message_id, f"\u23f3 \u8b80\u53d6\u300a{book['title']}\u300b\u8a73\u60c5...")
             if source == 'zxcs':
                 def load_zxcs():
-                    try:
-                        info = zxcs_book_info(book['url'])
-                        user_state[chat_id] = {'action': 'confirm', 'book': info}
-                        edit_message(chat_id, message_id, format_zxcs_card(info),
-                            reply_markup=make_confirm_keyboard('zxcs'))
-                    except Exception as e:
-                        edit_message(chat_id, message_id, f"\u274c \u8b80\u53d6\u5931\u6557\uff1a{e}")
-                threading.Thread(target=load_zxcs, daemon=True).start()
+                    info = zxcs_book_info(book['url'])
+                    user_state[chat_id] = {'action': 'confirm', 'book': info}
+                    edit_message(chat_id, message_id, format_zxcs_card(info),
+                        reply_markup=make_confirm_keyboard('zxcs'))
+                run_in_thread(load_zxcs)
             else:
                 def load_czbooks():
-                    try:
-                        html = get_html(book['url'])
-                        info = parse_book_info(html, book['url'])
-                        user_state[chat_id] = {'action': 'confirm', 'book': info}
-                        edit_message(chat_id, message_id, format_czbooks_card(info),
-                            reply_markup=make_confirm_keyboard('czbooks'))
-                    except Exception as e:
-                        edit_message(chat_id, message_id, f"\u274c \u8b80\u53d6\u5931\u6557\uff1a{e}")
-                threading.Thread(target=load_czbooks, daemon=True).start()
+                    html = get_html(book['url'])
+                    info = parse_book_info(html, book['url'])
+                    user_state[chat_id] = {'action': 'confirm', 'book': info}
+                    edit_message(chat_id, message_id, format_czbooks_card(info),
+                        reply_markup=make_confirm_keyboard('czbooks'))
+                run_in_thread(load_czbooks)
         return
 
     if data == 'confirm_download' and state.get('action') == 'confirm':
@@ -648,10 +683,9 @@ def handle_callback(cb):
         edit_message(chat_id, message_id,
             f"\ud83d\udce5 \u5df2\u52a0\u5165\u4e0b\u8f09\n\u300a{book['title']}\u300b\n\n/status \u67e5\u770b\u9032\u5ea6")
         if source == 'zxcs':
-            threading.Thread(target=zxcs_download, args=(chat_id, book), daemon=True).start()
+            run_in_thread(zxcs_download, chat_id, book)
         else:
-            threading.Thread(target=download_czbooks,
-                args=(chat_id, book['url'], book['title']), daemon=True).start()
+            run_in_thread(download_czbooks, chat_id, book['url'], book['title'])
         return
 
     if data == 'back':
@@ -674,23 +708,30 @@ def clear_old_updates():
         print(f"Warning: could not clear updates: {e}")
 
 def run():
-    print("Novel Bot v4 started - stable polling")
-    clear_old_updates()
+    if not BOT_TOKEN:
+        log("ERROR: NOVEL_BOT_TOKEN not set")
+        return
+    log(f"Novel Bot v4 started | TONY_ID={TONY_ID}")
     offset = 0
     while True:
         try:
             r = requests.get(f"{API}/getUpdates",
-                params={'offset': offset, 'timeout': 20}, timeout=25)
-            for u in r.json().get('result', []):
+                params={'offset': offset, 'timeout': 30}, timeout=35)
+            updates = r.json().get('result', [])
+            for u in updates:
                 offset = u['update_id'] + 1
                 if 'message' in u:
-                    threading.Thread(target=handle_message,
-                        args=(u['message'],), daemon=True).start()
+                    from_id = u['message']['chat']['id']
+                    text_preview = u['message'].get('text', '')[:40]
+                    log(f"[MSG] from={from_id} text={text_preview!r}")
+                    run_in_thread(handle_message, u['message'])
                 elif 'callback_query' in u:
-                    threading.Thread(target=handle_callback,
-                        args=(u['callback_query'],), daemon=True).start()
+                    from_id = u['callback_query']['message']['chat']['id']
+                    cb_data = u['callback_query'].get('data', '')
+                    log(f"[CB] from={from_id} data={cb_data!r}")
+                    run_in_thread(handle_callback, u['callback_query'])
         except Exception as e:
-            print(f"Error: {e}")
+            log(f"[POLL ERROR] {e}")
             time.sleep(5)
 
 if __name__ == '__main__':
