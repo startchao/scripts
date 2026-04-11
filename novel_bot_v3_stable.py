@@ -43,7 +43,12 @@ PAGE_SIZE = 8
 
 # ── Telegram helpers ──────────────────────────────────────────
 
+def _fix_surrogates(text):
+    """把 surrogate pair（如 \\ud83d\\udcda）還原成正確的 Unicode 字元（如 📚）。"""
+    return text.encode('utf-16', 'surrogatepass').decode('utf-16')
+
 def send(chat_id, text, parse_mode='HTML', reply_markup=None):
+    text = _fix_surrogates(text)
     data = {'chat_id': chat_id, 'text': text, 'parse_mode': parse_mode}
     if reply_markup:
         data['reply_markup'] = json.dumps(reply_markup)
@@ -55,6 +60,7 @@ def send(chat_id, text, parse_mode='HTML', reply_markup=None):
         log(f"[send EXCEPTION] {e}")
 
 def edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
+    text = _fix_surrogates(text)
     data = {'chat_id': chat_id, 'message_id': message_id,
             'text': text, 'parse_mode': parse_mode}
     if reply_markup:
